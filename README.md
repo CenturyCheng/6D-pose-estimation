@@ -1,4 +1,4 @@
-# 6D Pose Estimation - Analysis by Synthesis
+# 6D Pose Estimation
 
 基于分析合成方法的6D位姿估计工具，使用CMA-ES优化算法将3D网格模型与2D目标图像对齐，估计相机的方位角、仰角和距离参数。
 
