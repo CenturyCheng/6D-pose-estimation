@@ -167,8 +167,9 @@ class PanoramaRenderer:
     
     def _setup_scene(self):
         """设置渲染场景"""
+        # 法线默认色：RGB(128, 128, 255) = 归一化后的 (0.5, 0.5, 1.0)
         self.scene = pyrender.Scene(
-            bg_color=[0.0, 0.0, 0.0, 0.0],
+            bg_color=[0.5, 0.5, 1.0, 1.0],  # 法线默认背景色（蓝紫色）
             ambient_light=[0.3, 0.3, 0.3]
         )
         

@@ -1,8 +1,10 @@
 """
-基于分析合成的6D位姿估计
+基于法线匹配的6D位姿估计
 =============================================
-使用CMA-ES优化算法，通过将3D网格的轮廓与目标2D二值掩码对齐，
+使用CMA-ES优化算法，通过将3D网格渲染的法线图与目标法线图对齐，
 来估计相机参数（方位角、仰角、距离）。
+
+渲染背景为黑色，通过AABB包围盒匹配对齐，使用RGB归一化向量差计算相似度。
 
 依赖: pip install pyrender trimesh cma opencv-python numpy matplotlib
 """
@@ -16,6 +18,9 @@ import matplotlib.pyplot as plt
 from typing import Tuple, Optional, Dict, Any
 import os
 import shutil
+from concurrent.futures import ProcessPoolExecutor
+from functools import partial
+import multiprocessing
 
 # ============================================================================
 # 可调整参数配置区
@@ -27,34 +32,42 @@ TARGET_MASK_PATH = "./target.png"   # 目标二值掩码图像路径
 OUTPUT_DIR = "./output"             # 输出结果保存目录
 
 # --- 渲染参数 ---
-RENDER_WIDTH = 256                  # 渲染图像宽度（像素）
-RENDER_HEIGHT = 256                 # 渲染图像高度（像素）
+RENDER_WIDTH = 512                  # 渲染图像宽度（像素）
+RENDER_HEIGHT = 512                 # 渲染图像高度（像素）
 CAMERA_FOV = 45.0                   # 相机视场角（度）
 
 # --- CMA-ES优化参数 ---
-CMAES_SIGMA = 10.0                   # CMA-ES初始步长（标准差）
-CMAES_POPSIZE = 50                  # 种群大小（每代评估的个体数）
-CMAES_MAXITER = 200                 # 最大迭代次数
-CMAES_TOLX = 1e-5                   # 参数变化容差（收敛条件）
-CMAES_TOLFUN = 1e-6                 # 目标函数值容差（收敛条件）
+CMAES_SIGMA = 1.5                   # CMA-ES全局初始步长（各维度由CMA_stds控制）
+CMAES_POPSIZE = 80                  # 种群大小 - 更大种群提高全局搜索覆盖度
+CMAES_MAXITER = 100                 # 最大迭代次数
+CMAES_TOLX = 1e-4                   # 参数变化容差（收敛条件）
+CMAES_TOLFUN = 5e-5                 # 目标函数值容差（收敛条件）
+
+# --- 并行计算参数 ---
+USE_PARALLEL = True                 # 是否使用并行计算
+NUM_WORKERS = None                  # 并行进程数（None=自动：CPU核数的一半，最少1个，最多留4核给系统）
 
 # --- 参数搜索范围 ---
 AZIMUTH_RANGE = (0.0, 2 * np.pi)    # 方位角范围（弧度），0~2π
-ELEVATION_RANGE = (-89.0, 89.0)     # 仰角范围（度），避免万向锁
-DISTANCE_MIN = 0.8                 # 最小距离（相对于网格尺寸的倍数）
-DISTANCE_MAX = 5.0                  # 最大距离（相对于网格尺寸的倍数）
+ELEVATION_RANGE = (-60.0, 80.0)     # 仰角范围（度），限制为合理的正面视角（避免俯视）
+DISTANCE_MIN = 1.0                  # 最小相对距离（相对于网格对角线的倍数）
+DISTANCE_MAX = 20.0                 # 最大相对距离
+# CMA-ES 在对数空间优化距离: actual_dist = mesh_scale * exp(log_rel_dist)
+LOG_DIST_MIN = np.log(DISTANCE_MIN) 
+LOG_DIST_MAX = np.log(DISTANCE_MAX) 
 
 # --- 其他设置 ---
 VERBOSE = True                      # 是否打印详细信息
 SAVE_VISUALIZATION = True           # 是否保存可视化结果
 SHOW_INTERACTIVE = False            # 是否显示交互式pyrender窗口
-DEBUG_OUTPUT = False                 # 是否输出调试渲染图像
-USE_DEPTH_GRADIENT = False          # 是否使用深度梯度进行判断（True=深度梯度，False=mask）
+DEBUG_OUTPUT = True                  # 是否输出调试渲染图像
 
 # ============================================================================
-# 设置无头渲染环境（服务器环境必需）
+# 设置无头渲染环境（避免窗口闪烁）
 # ============================================================================
-# os.environ['PYOPENGL_PLATFORM'] = 'egl'
+# 注意：在Windows上，并行渲染时设置osmesa可以避免窗口闪烁
+# 但需要确保在子进程中也设置此环境变量
+# os.environ['PYOPENGL_PLATFORM'] = 'osmesa'
 
 
 def pad_to_square(image: np.ndarray, pad_value: int = 0) -> np.ndarray:
@@ -146,6 +159,329 @@ def look_at(eye: np.ndarray, target: np.ndarray, up: np.ndarray = None) -> np.nd
     return matrix
 
 
+# ============================================================================
+# 并行计算辅助函数 - 使用全局变量缓存渲染器
+# ============================================================================
+
+# 全局变量：在每个worker进程中缓存渲染器资源
+_worker_renderer = None
+_worker_scene = None
+_worker_mesh = None
+_worker_camera_node = None
+
+def _init_worker(mesh_path: str, render_resolution: Tuple[int, int]):
+    """
+    初始化worker进程的渲染资源（每个进程只调用一次）
+    """
+    global _worker_renderer, _worker_scene, _worker_mesh, _worker_camera_node
+
+    import numpy as np
+    import trimesh
+    import pyrender
+    import warnings
+
+    # 抑制警告
+    warnings.filterwarnings('ignore')
+
+    # 加载网格（只加载一次）
+    mesh = trimesh.load(mesh_path, force='mesh')
+    _worker_mesh = mesh
+
+    # 创建场景
+    _worker_scene = pyrender.Scene(
+        bg_color=[0.0, 0.0, 0.0, 1.0],
+        ambient_light=[0.3, 0.3, 0.3]
+    )
+
+    # 添加网格
+    material = pyrender.MetallicRoughnessMaterial(
+        baseColorFactor=[1.0, 1.0, 1.0, 1.0],
+        metallicFactor=0.0,
+        roughnessFactor=1.0
+    )
+    pyrender_mesh = pyrender.Mesh.from_trimesh(mesh, material=material)
+    _worker_scene.add(pyrender_mesh)
+
+    # 添加光源
+    light = pyrender.DirectionalLight(color=[1.0, 1.0, 1.0], intensity=2.0)
+    _worker_scene.add(light, pose=np.eye(4))
+
+    # 创建渲染器（只创建一次）
+    _worker_renderer = pyrender.OffscreenRenderer(
+        viewport_width=render_resolution[0],
+        viewport_height=render_resolution[1]
+    )
+
+    _worker_camera_node = None
+
+
+def _evaluate_single_solution(
+    params: np.ndarray,
+    target_normal: np.ndarray,
+    mesh_center: np.ndarray,
+    mesh_scale: float
+) -> float:
+    """
+    在worker进程中评估单个解（使用缓存的渲染器）
+
+    参数:
+        params: [azimuth, elevation, log_rel_dist] 参数
+        target_normal: 目标法线图
+        mesh_center: 网格中心
+        mesh_scale: 网格尺度
+
+    返回:
+        负相似度值（因为CMA-ES最小化）
+    """
+    global _worker_renderer, _worker_scene, _worker_mesh, _worker_camera_node
+
+    import numpy as np
+    import cv2
+
+    # 规范化参数
+    azimuth, elevation, log_rel_dist = params
+    azimuth = azimuth % (2 * np.pi)
+    elevation = np.clip(elevation, ELEVATION_RANGE[0], ELEVATION_RANGE[1])
+    log_rel_dist = np.clip(log_rel_dist, LOG_DIST_MIN, LOG_DIST_MAX)
+    distance = mesh_scale * np.exp(log_rel_dist)
+
+    # 计算相机位置（球坐标转笛卡尔坐标）
+    el = np.radians(elevation)
+    y = distance * np.sin(el)
+    r_horizontal = distance * np.cos(el)
+    x = r_horizontal * np.cos(azimuth)
+    z = r_horizontal * np.sin(azimuth)
+    camera_position = np.array([x, y, z]) + mesh_center
+
+    # 计算相机位姿
+    eye = camera_position
+    target = mesh_center
+    up = np.array([0.0, 1.0, 0.0])
+
+    z_axis = eye - target
+    z_axis = z_axis / np.linalg.norm(z_axis)
+    x_axis = np.cross(up, z_axis)
+    if np.linalg.norm(x_axis) < 1e-6:
+        x_axis = np.cross(np.array([1.0, 0.0, 0.0]), z_axis)
+    x_axis = x_axis / np.linalg.norm(x_axis)
+    y_axis = np.cross(z_axis, x_axis)
+    y_axis = y_axis / np.linalg.norm(y_axis)
+
+    camera_pose = np.eye(4, dtype=np.float64)
+    camera_pose[:3, 0] = x_axis
+    camera_pose[:3, 1] = y_axis
+    camera_pose[:3, 2] = z_axis
+    camera_pose[:3, 3] = eye
+
+    # 计算自适应FOV
+    bounds = _worker_mesh.bounds
+    corners = np.array([
+        [bounds[0, 0], bounds[0, 1], bounds[0, 2]],
+        [bounds[1, 0], bounds[0, 1], bounds[0, 2]],
+        [bounds[0, 0], bounds[1, 1], bounds[0, 2]],
+        [bounds[1, 0], bounds[1, 1], bounds[0, 2]],
+        [bounds[0, 0], bounds[0, 1], bounds[1, 2]],
+        [bounds[1, 0], bounds[0, 1], bounds[1, 2]],
+        [bounds[0, 0], bounds[1, 1], bounds[1, 2]],
+        [bounds[1, 0], bounds[1, 1], bounds[1, 2]],
+    ])
+
+    to_center = mesh_center - camera_position
+    dist_to_center = np.linalg.norm(to_center)
+    right = x_axis
+    up_vec = y_axis
+
+    max_horizontal = 0.0
+    max_vertical = 0.0
+    for corner in corners:
+        to_corner = corner - camera_position
+        horizontal_proj = np.dot(to_corner, right)
+        vertical_proj = np.dot(to_corner, up_vec)
+        horizontal_angle = np.abs(np.arctan2(horizontal_proj, dist_to_center))
+        vertical_angle = np.abs(np.arctan2(vertical_proj, dist_to_center))
+        max_horizontal = max(max_horizontal, horizontal_angle)
+        max_vertical = max(max_vertical, vertical_angle)
+
+    fov_horizontal = 2 * max_horizontal * 1.15
+    fov_vertical = 2 * max_vertical * 1.15
+
+    # 获取渲染器的宽高比
+    render_width = _worker_renderer.viewport_width
+    render_height = _worker_renderer.viewport_height
+    aspect_ratio = render_width / render_height
+
+    fov_vertical_from_horizontal = 2 * np.arctan(np.tan(fov_horizontal / 2) / aspect_ratio)
+    adaptive_fov = max(fov_vertical, fov_vertical_from_horizontal)
+    adaptive_fov_deg = np.degrees(adaptive_fov)
+    adaptive_fov_deg = np.clip(adaptive_fov_deg, 10.0, 120.0)
+
+    # 更新场景中的相机
+    import pyrender
+    camera = pyrender.PerspectiveCamera(
+        yfov=np.radians(adaptive_fov_deg),
+        aspectRatio=aspect_ratio
+    )
+
+    # 移除旧相机，添加新相机
+    if _worker_camera_node is not None:
+        _worker_scene.remove_node(_worker_camera_node)
+    _worker_camera_node = _worker_scene.add(camera, pose=camera_pose)
+
+    # 使用缓存的渲染器渲染
+    flags = pyrender.RenderFlags.SKIP_CULL_FACES
+    color, depth = _worker_renderer.render(_worker_scene, flags=flags)
+
+    # 从深度图生成法线图
+    h, w = depth.shape
+    fx = fy = (h / 2.0) / np.tan(np.radians(adaptive_fov_deg) / 2.0)
+    cx, cy = w / 2.0, h / 2.0
+
+    u, v = np.meshgrid(np.arange(w), np.arange(h))
+    x_img = (u - cx) * depth / fx
+    y_img = (v - cy) * depth / fy
+    z_img = depth
+
+    x_padded = np.pad(x_img, ((1, 1), (1, 1)), mode='edge')
+    y_padded = np.pad(y_img, ((1, 1), (1, 1)), mode='edge')
+    z_padded = np.pad(z_img, ((1, 1), (1, 1)), mode='edge')
+
+    tx = (x_padded[1:-1, 2:] - x_padded[1:-1, :-2]) / 2.0
+    ty = (y_padded[1:-1, 2:] - y_padded[1:-1, :-2]) / 2.0
+    tz = (z_padded[1:-1, 2:] - z_padded[1:-1, :-2]) / 2.0
+
+    bx = (x_padded[2:, 1:-1] - x_padded[:-2, 1:-1]) / 2.0
+    by = (y_padded[2:, 1:-1] - y_padded[:-2, 1:-1]) / 2.0
+    bz = (z_padded[2:, 1:-1] - z_padded[:-2, 1:-1]) / 2.0
+
+    normal_x = ty * bz - tz * by
+    normal_y = tz * bx - tx * bz
+    normal_z = tx * by - ty * bx
+
+    norm = np.sqrt(normal_x**2 + normal_y**2 + normal_z**2)
+    norm = np.maximum(norm, 1e-8)
+
+    normal_x /= norm
+    normal_y /= norm
+    normal_z /= norm
+
+    flip_mask = normal_z < 0
+    normal_x = np.where(flip_mask, -normal_x, normal_x)
+    normal_y = np.where(flip_mask, -normal_y, normal_y)
+    normal_z = np.where(flip_mask, -normal_z, normal_z)
+
+    normal_x = -normal_x * 0.5 + 0.5
+    normal_y = normal_y * 0.5 + 0.5
+    normal_z = normal_z * 0.5 + 0.5
+
+    normal_map = np.stack([normal_x, normal_y, normal_z], axis=-1)
+    normal_map = (normal_map * 255).astype(np.uint8)
+
+    mask = depth > 1e-3
+    normal_map[~mask] = [0, 0, 0]
+
+    rendered_normal = normal_map
+
+    # 调整尺寸
+    # 调整尺寸
+    if rendered_normal.shape[:2] != target_normal.shape[:2]:
+        rendered_normal = cv2.resize(
+            rendered_normal,
+            (target_normal.shape[1], target_normal.shape[0]),
+            interpolation=cv2.INTER_LINEAR
+        )
+
+    # 计算AABB并对齐
+    def compute_bbox(image, is_target=False):
+        if is_target:
+            brightness = np.max(image, axis=-1)
+            fg_mask = brightness >= 6
+        else:
+            fg_mask = np.any(image > 0, axis=-1)
+        y_coords, x_coords = np.where(fg_mask)
+        if len(x_coords) == 0:
+            return (0, 0, image.shape[1], image.shape[0])
+        return (int(np.min(x_coords)), int(np.min(y_coords)),
+               int(np.max(x_coords)), int(np.max(y_coords)))
+
+    r_bbox = compute_bbox(rendered_normal, is_target=False)
+    t_bbox = compute_bbox(target_normal, is_target=True)
+
+    r_cx = (r_bbox[0] + r_bbox[2]) / 2.0
+    r_cy = (r_bbox[1] + r_bbox[3]) / 2.0
+    r_w = r_bbox[2] - r_bbox[0]
+    r_h = r_bbox[3] - r_bbox[1]
+
+    t_cx = (t_bbox[0] + t_bbox[2]) / 2.0
+    t_cy = (t_bbox[1] + t_bbox[3]) / 2.0
+    t_w = t_bbox[2] - t_bbox[0]
+    t_h = t_bbox[3] - t_bbox[1]
+
+    if r_w > 0 and r_h > 0:
+        scale_x = t_w / r_w
+        scale_y = t_h / r_h
+    else:
+        scale_x = 1.0
+        scale_y = 1.0
+
+    M = np.array([
+        [scale_x, 0, t_cx - scale_x * r_cx],
+        [0, scale_y, t_cy - scale_y * r_cy]
+    ], dtype=np.float32)
+
+    aligned = cv2.warpAffine(
+        rendered_normal,
+        M,
+        (target_normal.shape[1], target_normal.shape[0]),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=(0, 0, 0)
+    )
+
+    # 计算相似度
+    aligned_fg_full = np.any(aligned > 0, axis=-1)
+    target_fg_full = np.max(target_normal, axis=-1) >= 6
+
+    intersection = np.sum(aligned_fg_full & target_fg_full)
+    union = np.sum(aligned_fg_full | target_fg_full)
+    silhouette_iou = intersection / max(union, 1)
+
+    min_x, min_y, max_x, max_y = t_bbox
+    region_aligned = aligned[min_y:max_y+1, min_x:max_x+1].astype(np.float32)
+    region_target = target_normal[min_y:max_y+1, min_x:max_x+1].astype(np.float32)
+
+    aligned_fg = np.any(region_aligned > 0, axis=-1)
+    target_fg = np.max(region_target, axis=-1) >= 6
+    valid_mask = aligned_fg & target_fg
+
+    valid_count = np.sum(valid_mask)
+    if valid_count == 0:
+        similarity = float(0.5 * silhouette_iou)
+    else:
+        v_aligned = region_aligned[valid_mask]
+        v_target = region_target[valid_mask]
+
+        norm_a = np.linalg.norm(v_aligned, axis=1, keepdims=True)
+        norm_t = np.linalg.norm(v_target, axis=1, keepdims=True)
+        norm_a = np.maximum(norm_a, 1e-8)
+        norm_t = np.maximum(norm_t, 1e-8)
+
+        v_aligned_unit = v_aligned / norm_a
+        v_target_unit = v_target / norm_t
+
+        diff = np.linalg.norm(v_aligned_unit - v_target_unit, axis=1)
+        mean_diff = np.mean(diff)
+        normal_similarity = 1.0 - mean_diff / 2.0
+
+        similarity = 0.5 * normal_similarity + 0.5 * silhouette_iou
+
+    # 返回负相似度（CMA-ES最小化）
+    return -similarity
+
+
+# ============================================================================
+# 位姿优化器类
+# ============================================================================
+
 class PoseOptimizer:
     """
     位姿优化器：通过分析合成方法估计相机位姿。
@@ -213,9 +549,9 @@ class PoseOptimizer:
     
     def _setup_scene(self):
         """设置pyrender渲染场景。"""
-        # 创建场景
+        # 创建场景 - 黑色背景
         self.scene = pyrender.Scene(
-            bg_color=[0.0, 0.0, 0.0, 0.0],  # 黑色背景
+            bg_color=[0.0, 0.0, 0.0, 1.0],  # 黑色背景
             ambient_light=[0.3, 0.3, 0.3]   # 环境光
         )
         
@@ -372,22 +708,21 @@ class PoseOptimizer:
         # 计算每个顶点在相机视图中的投影
         max_horizontal = 0.0
         max_vertical = 0.0
-        
+
         for corner in corners:
             # 从相机到顶点的向量
             to_corner = corner - camera_position
-            
+
             # 投影到相机视图平面
             # 水平方向投影（右方向）
             horizontal_proj = np.dot(to_corner, right)
             # 垂直方向投影（上方向）
             vertical_proj = np.dot(to_corner, up)
-            
-            # 计算视角（使用到中心的距离作为参考，避免近大远小的影响）
-            # 这样所有顶点都使用相同的参考距离，确保FOV计算准确
+
+            # 计算视角（使用到网格中心的距离）
             horizontal_angle = np.abs(np.arctan2(horizontal_proj, dist_to_center))
             vertical_angle = np.abs(np.arctan2(vertical_proj, dist_to_center))
-            
+
             max_horizontal = max(max_horizontal, horizontal_angle)
             max_vertical = max(max_vertical, vertical_angle)
         
@@ -409,55 +744,160 @@ class PoseOptimizer:
         # 转换为度数
         fov_deg = np.degrees(fov)
         
-        # 限制FOV在合理范围内（避免过小或过大）
-        fov_deg = np.clip(fov_deg, 1.0, 120.0)
+        # 限制FOV在合理范围内
+        # 下限不能太小，否则趋近正交投影，失去透视效果
+        fov_deg = np.clip(fov_deg, 10.0, 120.0)
         
         return fov_deg
     
+    def depth_to_view_space_normal(self, depth: np.ndarray, camera_pose: np.ndarray, fov: float = None) -> np.ndarray:
+        """
+        从深度图计算视图空间法线（切线空间法线）
+
+        参数:
+            depth: 深度图 (H, W)
+            camera_pose: 相机位姿矩阵
+            fov: 实际使用的FOV（度），如果为None则使用self.fov
+
+        返回:
+            视图空间法线图 (H, W, 3)，RGB值范围[0, 255]
+        """
+        h, w = depth.shape
+
+        # 使用实际渲染时的FOV计算内参
+        actual_fov = fov if fov is not None else self.fov
+        fx = fy = (h / 2.0) / np.tan(np.radians(actual_fov) / 2.0)
+        cx, cy = w / 2.0, h / 2.0
+
+        # 重建3D点云（相机空间）
+        u, v = np.meshgrid(np.arange(w), np.arange(h))
+        x = (u - cx) * depth / fx
+        y = (v - cy) * depth / fy
+        z = depth
+
+        # 使用交叉乘积计算表面法线
+        # 对于每个像素，使用其上下左右邻居计算切线向量，然后计算法线
+
+        # 计算x和y方向的偏导数（使用中心差分）
+        # dx = (右边点 - 左边点) / 2
+        # dy = (下边点 - 上边点) / 2
+
+        # Pad arrays to handle边界
+        x_padded = np.pad(x, ((1, 1), (1, 1)), mode='edge')
+        y_padded = np.pad(y, ((1, 1), (1, 1)), mode='edge')
+        z_padded = np.pad(z, ((1, 1), (1, 1)), mode='edge')
+
+        # 计算沿u方向的切向量 (右 - 左)
+        tx = (x_padded[1:-1, 2:] - x_padded[1:-1, :-2]) / 2.0
+        ty = (y_padded[1:-1, 2:] - y_padded[1:-1, :-2]) / 2.0
+        tz = (z_padded[1:-1, 2:] - z_padded[1:-1, :-2]) / 2.0
+
+        # 计算沿v方向的切向量 (下 - 上)
+        bx = (x_padded[2:, 1:-1] - x_padded[:-2, 1:-1]) / 2.0
+        by = (y_padded[2:, 1:-1] - y_padded[:-2, 1:-1]) / 2.0
+        bz = (z_padded[2:, 1:-1] - z_padded[:-2, 1:-1]) / 2.0
+
+        # 法线 = 切向量的叉乘 (tangent_u × tangent_v)
+        # 注意OpenGL/相机坐标系：X右，Y上，Z向后（指向相机）
+        # 所以需要反转法线方向使其指向相机
+        normal_x = ty * bz - tz * by
+        normal_y = tz * bx - tx * bz
+        normal_z = tx * by - ty * bx
+
+        # 归一化法线
+        norm = np.sqrt(normal_x**2 + normal_y**2 + normal_z**2)
+        norm = np.maximum(norm, 1e-8)  # 避免除零
+
+        normal_x /= norm
+        normal_y /= norm
+        normal_z /= norm
+
+        # 确保法线指向相机（Z分量应该是正的，因为相机看向-Z）
+        # 如果Z是负的，翻转法线
+        flip_mask = normal_z < 0
+        normal_x = np.where(flip_mask, -normal_x, normal_x)
+        normal_y = np.where(flip_mask, -normal_y, normal_y)
+        normal_z = np.where(flip_mask, -normal_z, normal_z)
+
+        # 转换到 [0, 1] 范围
+        # 法线从 [-1, 1] 映射到 [0, 1]，然后到 [0, 255]
+        # 注意：翻转X轴以匹配Sunshineflow的法线约定（右侧=红色）
+        normal_x = -normal_x * 0.5 + 0.5  # 翻转X
+        normal_y = normal_y * 0.5 + 0.5
+        normal_z = normal_z * 0.5 + 0.5
+
+        # 组合成RGB图像 (R=X, G=Y, B=Z)
+        normal_map = np.stack([normal_x, normal_y, normal_z], axis=-1)
+
+        # 转换到 [0, 255] 范围
+        normal_map = (normal_map * 255).astype(np.uint8)
+
+        # 对于背景区域（depth=0或非常小），填充黑色 (0, 0, 0)
+        mask = depth > 1e-3
+        normal_map[~mask] = [0, 0, 0]
+
+        return normal_map
+
     def render_silhouette(
-        self, 
-        azimuth: float, 
-        elevation: float, 
+        self,
+        azimuth: float,
+        elevation: float,
         distance: float,
         use_adaptive_fov: bool = True,
-        return_depth: bool = False
+        return_depth: bool = False,
+        return_normal: bool = False
     ) -> np.ndarray:
         """
-        渲染给定相机参数下的网格轮廓或深度图。
-        
+        渲染给定相机参数下的网格轮廓、深度图或法线图。
+
         参数:
             azimuth: 方位角（弧度）
             elevation: 仰角（度）
             distance: 距离
             use_adaptive_fov: 是否使用自适应FOV（默认True）
-            return_depth: 是否返回深度图（默认False，返回二值mask）
-        
+            return_depth: 是否返回深度图（默认False）
+            return_normal: 是否返回法线图（默认False）
+
         返回:
-            如果return_depth=False: 二值轮廓图像 (H, W)，值为0或255
+            如果return_normal=True: 法线图 (H, W, 3)，RGB值范围[0, 255]
             如果return_depth=True: 深度图 (H, W)，值为深度值
+            否则: 二值轮廓图像 (H, W)，值为0或255
         """
         # 获取相机位姿
         camera_pose = self.get_camera_pose(azimuth, elevation, distance)
-        
+
         # 计算自适应FOV
         if use_adaptive_fov:
-            adaptive_fov = self.compute_adaptive_fov(azimuth, elevation, distance, margin=0.05)
+            adaptive_fov = self.compute_adaptive_fov(azimuth, elevation, distance, margin=0.15)
+            actual_fov = adaptive_fov
             # 创建新的相机实例，避免修改全局相机FOV
             camera = pyrender.PerspectiveCamera(
                 yfov=np.radians(adaptive_fov),
                 aspectRatio=self.render_resolution[0] / self.render_resolution[1]
             )
         else:
+            actual_fov = self.fov
             camera = self.camera
-        
+
         # 更新场景中的相机
         if self.camera_node is not None:
             self.scene.remove_node(self.camera_node)
         self.camera_node = self.scene.add(camera, pose=camera_pose)
-        
+
         # 渲染
-        color, depth = self.renderer.render(self.scene)
-        
+        if return_normal:
+            # 渲染法线图（使用pyrender的normals标志）
+            flags = pyrender.RenderFlags.SKIP_CULL_FACES
+            color, depth = self.renderer.render(self.scene, flags=flags)
+
+            # pyrender返回的color已经包含了法线信息（当材质设置正确时）
+            # 但我们需要直接获取几何法线，所以重新渲染获取法线
+            # 使用自定义shader或通过深度重建法线
+            normal_map = self.depth_to_view_space_normal(depth, camera_pose, fov=actual_fov)
+            return normal_map
+        else:
+            color, depth = self.renderer.render(self.scene)
+
         if return_depth:
             # 返回深度图
             return depth
@@ -466,461 +906,291 @@ class PoseOptimizer:
             silhouette = (depth > 6).astype(np.uint8) * 255
             return silhouette
     
-    def compute_mask_center(self, mask: np.ndarray) -> np.ndarray:
+    def compute_foreground_bbox(self, image: np.ndarray, is_target: bool = False) -> Tuple[int, int, int, int]:
         """
-        计算mask的2D中心（基于非零像素的质心）。
-        
+        计算图像前景区域的AABB包围盒。
+
+        对于渲染图：非黑色区域（RGB任一通道 > 0）
+        对于目标图：明度 >= 6 的区域
+
         参数:
-            mask: 二值掩码
-        
-        返回:
-            [x, y] 中心坐标
-        """
-        # 获取非零像素的坐标
-        y_coords, x_coords = np.where(mask > 6)
-        
-        if len(x_coords) == 0:
-            # 如果mask为空，返回图像中心
-            return np.array([mask.shape[1] / 2, mask.shape[0] / 2])
-        
-        # 计算质心
-        center_x = np.mean(x_coords)
-        center_y = np.mean(y_coords)
-        
-        return np.array([center_x, center_y])
-    
-    def compute_mask_bbox(self, mask: np.ndarray) -> Tuple[float, float, float, float]:
-        """
-        计算mask的AABB包围盒。
-        
-        参数:
-            mask: 二值掩码
-        
+            image: 输入图像 (H, W, 3) RGB格式
+            is_target: 是否为目标图（使用明度判断）
+
         返回:
             (min_x, min_y, max_x, max_y) 包围盒坐标
         """
-        # 获取非零像素的坐标（阈值设为1，因为target是深度灰度图）
-        y_coords, x_coords = np.where(mask > 6)
-        
+        if is_target:
+            # 目标图：计算明度，明度 >= 6 的区域为主体
+            # 明度 = max(R, G, B)
+            brightness = np.max(image, axis=-1)
+            fg_mask = brightness >= 6
+        else:
+            # 渲染图：非黑色区域（任一通道 > 0）
+            fg_mask = np.any(image > 0, axis=-1)
+
+        y_coords, x_coords = np.where(fg_mask)
+
         if len(x_coords) == 0:
-            # 如果mask为空，返回整个图像
-            return (0, 0, mask.shape[1], mask.shape[0])
-        
-        min_x = np.min(x_coords)
-        max_x = np.max(x_coords)
-        min_y = np.min(y_coords)
-        max_y = np.max(y_coords)
-        
+            # 如果前景为空，返回整个图像
+            return (0, 0, image.shape[1], image.shape[0])
+
+        min_x = int(np.min(x_coords))
+        max_x = int(np.max(x_coords))
+        min_y = int(np.min(y_coords))
+        max_y = int(np.max(y_coords))
+
         return (min_x, min_y, max_x, max_y)
     
-    def align_masks(
+    def align_rendered_to_target(
         self,
-        rendered_mask: np.ndarray,
-        target_mask: np.ndarray
+        rendered_normal: np.ndarray,
+        target_normal: np.ndarray
     ) -> np.ndarray:
         """
-        将渲染mask对齐到target mask（平移+缩放）。
-        
-        对齐步骤：
-        1. 计算两个mask的2D中心
-        2. 计算两个mask的AABB框尺寸
-        3. 计算缩放比例（基于AABB框的xyscale差的平均值）
-        4. 平移渲染mask使其中心与target mask中心对齐
-        5. 缩放渲染mask使其尺寸与target mask匹配
-        
+        将渲染法线图通过AABB box匹配对齐到目标法线图。
+
+        步骤：
+        1. 计算渲染图非黑色区域的AABB
+        2. 计算目标图明度>=6区域的AABB
+        3. 将渲染图的AABB平移缩放到目标图的AABB位置
+
         参数:
-            rendered_mask: 渲染的掩码
-            target_mask: 目标掩码
-        
+            rendered_normal: 渲染的法线图 (H, W, 3) RGB
+            target_normal: 目标法线图 (H, W, 3) RGB
+
         返回:
-            对齐后的渲染掩码
+            对齐后的渲染法线图 (H, W, 3)，背景为黑色
         """
-        # 计算两个mask的中心
-        rendered_center = self.compute_mask_center(rendered_mask)
-        target_center = self.compute_mask_center(target_mask)
-        
-        # 计算平移向量
-        translation = target_center - rendered_center
-        
-        # 计算两个mask的AABB框
-        rendered_bbox = self.compute_mask_bbox(rendered_mask)
-        target_bbox = self.compute_mask_bbox(target_mask)
-        
-        # 计算AABB框的宽度和高度
-        rendered_width = rendered_bbox[2] - rendered_bbox[0]
-        rendered_height = rendered_bbox[3] - rendered_bbox[1]
-        target_width = target_bbox[2] - target_bbox[0]
-        target_height = target_bbox[3] - target_bbox[1]
-        
-        # 计算缩放比例（基于xyscale差的平均值）
-        if rendered_width > 0 and rendered_height > 0:
-            scale_x = target_width / rendered_width
-            scale_y = target_height / rendered_height
-            scale = (scale_x + scale_y) / 2  # 平均值
+        # 计算两个图像的AABB
+        r_bbox = self.compute_foreground_bbox(rendered_normal, is_target=False)
+        t_bbox = self.compute_foreground_bbox(target_normal, is_target=True)
+
+        # 渲染图AABB的中心和尺寸
+        r_cx = (r_bbox[0] + r_bbox[2]) / 2.0
+        r_cy = (r_bbox[1] + r_bbox[3]) / 2.0
+        r_w = r_bbox[2] - r_bbox[0]
+        r_h = r_bbox[3] - r_bbox[1]
+
+        # 目标图AABB的中心和尺寸
+        t_cx = (t_bbox[0] + t_bbox[2]) / 2.0
+        t_cy = (t_bbox[1] + t_bbox[3]) / 2.0
+        t_w = t_bbox[2] - t_bbox[0]
+        t_h = t_bbox[3] - t_bbox[1]
+
+        # 计算独立的X/Y缩放比例
+        # 使用独立缩放而非统一缩放，消除透视造成的宽高比差异对匹配的影响
+        if r_w > 0 and r_h > 0:
+            scale_x = t_w / r_w
+            scale_y = t_h / r_h
         else:
-            scale = 1.0
-        
-        # 创建变换矩阵（平移+缩放）
-        # 先平移到原点，缩放，再平移到目标位置
+            scale_x = 1.0
+            scale_y = 1.0
+
+        scale = (scale_x + scale_y) / 2.0  # 用于返回值的平均缩放
+
+        # 创建仿射变换矩阵：独立X/Y缩放后平移
+        # new_x = scale_x * old_x + (t_cx - scale_x * r_cx)
+        # new_y = scale_y * old_y + (t_cy - scale_y * r_cy)
         M = np.array([
-            [scale, 0, target_center[0] - rendered_center[0] * scale],
-            [0, scale, target_center[1] - rendered_center[1] * scale]
+            [scale_x, 0, t_cx - scale_x * r_cx],
+            [0, scale_y, t_cy - scale_y * r_cy]
         ], dtype=np.float32)
-        
-        # 应用变换
-        aligned_mask = cv2.warpAffine(
-            rendered_mask,
+
+        # 对法线图应用变换，背景填充黑色
+        aligned = cv2.warpAffine(
+            rendered_normal,
             M,
-            (target_mask.shape[1], target_mask.shape[0]),
+            (target_normal.shape[1], target_normal.shape[0]),
             flags=cv2.INTER_LINEAR,
             borderMode=cv2.BORDER_CONSTANT,
-            borderValue=0
+            borderValue=(0, 0, 0)
         )
-        
-        # 二值化
-        _, aligned_mask = cv2.threshold(aligned_mask, 1, 255, cv2.THRESH_BINARY)
-        
-        return aligned_mask
-    
-    def compute_gradient(self, depth_map: np.ndarray, ksize: int = 3) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        计算深度图的梯度（Sobel算子）。
-        
-        参数:
-            depth_map: 深度图 (H, W)
-            ksize: Sobel算子核大小（默认3，可选1, 3, 5, 7）
-        
-        返回:
-            (grad_x, grad_y): x方向和y方向的梯度
-        """
-        # 使用Sobel算子计算梯度
-        grad_x = cv2.Sobel(depth_map, cv2.CV_64F, 1, 0, ksize=ksize)
-        grad_y = cv2.Sobel(depth_map, cv2.CV_64F, 0, 1, ksize=ksize)
-        
-        return grad_x, grad_y
-    
-    def compute_gradient_similarity(self, depth1: np.ndarray, depth2: np.ndarray, align: bool = True) -> float:
-        """
-        计算两个深度图之间的梯度相似度。
-        
-        参数:
-            depth1: 第一个深度图
-            depth2: 第二个深度图
-            align: 是否在计算相似度前对齐（默认True）
-        
-        返回:
-            相似度值，范围[0, 1]，值越大表示越相似
-        """
-        # 如果需要对齐，将depth1对齐到depth2
-        if align:
-            # 生成mask用于对齐
-            mask1 = (depth1 > 6).astype(np.uint8) * 255
-            mask2 = (depth2 > 6).astype(np.uint8) * 255
-            mask1_aligned = self.align_masks(mask1, mask2)
-            
-            # 使用对齐后的mask来对齐深度图
-            depth1_aligned = self.align_depth_with_mask(depth1, mask1, mask1_aligned, depth2.shape)
-        else:
-            depth1_aligned = depth1
-        
-        # 计算梯度
-        grad1_x, grad1_y = self.compute_gradient(depth1_aligned, ksize=1)
-        grad2_x, grad2_y = self.compute_gradient(depth2, ksize=3)
-        
-        # 计算梯度幅值
-        grad1_mag = np.sqrt(grad1_x**2 + grad1_y**2)
-        grad2_mag = np.sqrt(grad2_x**2 + grad2_y**2)
-        
-        # 归一化梯度幅值
-        grad1_mag_norm = grad1_mag / (np.max(grad1_mag) + 1e-8)
-        grad2_mag_norm = grad2_mag / (np.max(grad2_mag) + 1e-8)
-        
-        # 计算相似度（使用余弦相似度）
-        # 将梯度展平
-        grad1_flat = grad1_mag_norm.flatten()
-        grad2_flat = grad2_mag_norm.flatten()
-        
-        # 只考虑有效区域（深度>0的区域）
-        valid_mask = (depth1_aligned > 6) & (depth2 > 6)
-        valid_mask_flat = valid_mask.flatten()
-        
-        if np.sum(valid_mask_flat) == 0:
-            return 0.0
-        
-        grad1_valid = grad1_flat[valid_mask_flat]
-        grad2_valid = grad2_flat[valid_mask_flat]
-        
-        # 计算余弦相似度
-        dot_product = np.dot(grad1_valid, grad2_valid)
-        norm1 = np.linalg.norm(grad1_valid)
-        norm2 = np.linalg.norm(grad2_valid)
-        
-        if norm1 == 0 or norm2 == 0:
-            return 0.0
-        
-        similarity = dot_product / (norm1 * norm2)
-        
-        return float(similarity)
-    
-    def align_depth_with_mask(
+
+        return aligned, scale
+
+    def compute_normal_similarity(
         self,
-        depth: np.ndarray,
-        original_mask: np.ndarray,
-        aligned_mask: np.ndarray,
-        target_shape: Tuple[int, int]
-    ) -> np.ndarray:
+        rendered_normal: np.ndarray,
+        target_normal: np.ndarray,
+        align: bool = True
+    ) -> float:
         """
-        使用mask的对齐变换来对齐深度图。
-        
+        计算两个法线图之间的相似度（综合法线方向 + 轮廓形状）。
+
+        流程：
+        1. 将渲染法线图通过AABB对齐到目标法线图
+        2. 在对齐后的全图上计算轮廓IoU（前景掩码的交集/并集）
+        3. 在目标AABB区域内，对重叠像素做RGB归一化向量差
+        4. 综合评分 = 0.5 * normal_sim + 0.5 * silhouette_iou
+
         参数:
-            depth: 原始深度图
-            original_mask: 原始mask（用于计算变换）
-            aligned_mask: 对齐后的mask（用于推断变换）
-            target_shape: 目标形状 (H, W)
-        
+            rendered_normal: 渲染的法线图 (H, W, 3) RGB
+            target_normal: 目标法线图 (H, W, 3) RGB
+            align: 是否在计算前对齐
+
         返回:
-            对齐后的深度图
+            相似度值 [0, 1]，1表示完全相同
         """
-        # 计算原始mask和对齐mask的中心
-        original_center = self.compute_mask_center(original_mask)
-        aligned_center = self.compute_mask_center(aligned_mask)
-        
-        # 计算原始mask和对齐mask的AABB框
-        original_bbox = self.compute_mask_bbox(original_mask)
-        aligned_bbox = self.compute_mask_bbox(aligned_mask)
-        
-        # 计算AABB框的宽度和高度
-        original_width = original_bbox[2] - original_bbox[0]
-        original_height = original_bbox[3] - original_bbox[1]
-        aligned_width = aligned_bbox[2] - aligned_bbox[0]
-        aligned_height = aligned_bbox[3] - aligned_bbox[1]
-        
-        # 计算缩放比例
-        if original_width > 0 and original_height > 0:
-            scale_x = aligned_width / original_width
-            scale_y = aligned_height / original_height
-            scale = (scale_x + scale_y) / 2
-        else:
-            scale = 1.0
-        
-        # 创建变换矩阵
-        M = np.array([
-            [scale, 0, aligned_center[0] - original_center[0] * scale],
-            [0, scale, aligned_center[1] - original_center[1] * scale]
-        ], dtype=np.float32)
-        
-        # 应用变换到深度图
-        aligned_depth = cv2.warpAffine(
-            depth,
-            M,
-            (target_shape[1], target_shape[0]),
-            flags=cv2.INTER_LINEAR,
-            borderMode=cv2.BORDER_CONSTANT,
-            borderValue=0
-        )
-        
-        return aligned_depth
-    
-    def compute_iou(self, mask1: np.ndarray, mask2: np.ndarray, align: bool = True) -> float:
-        """
-        计算两个二值掩码之间的IoU（交并比）。
-        
-        参数:
-            mask1: 第一个掩码
-            mask2: 第二个掩码
-            align: 是否在计算IoU前对齐mask（默认True）
-        
-        返回:
-            IoU值，范围[0, 1]
-        """
-        # 如果需要对齐，将mask1对齐到mask2
         if align:
-            mask1 = self.align_masks(mask1, mask2)
-        
-        # 确保是二值掩码（阈值设为1，因为target是深度灰度图）
-        m1 = (mask1 > 6).astype(bool)
-        m2 = (mask2 > 6).astype(bool)
-        
-        # 计算交集和并集
-        intersection = np.logical_and(m1, m2).sum()
-        union = np.logical_or(m1, m2).sum()
-        
-        if union == 0:
-            return 0.0
-        
-        return float(intersection) / float(union)
-    
+            aligned, scale = self.align_rendered_to_target(rendered_normal, target_normal)
+        else:
+            aligned = rendered_normal.copy()
+            scale = 1.0
+
+        # === 1. 轮廓IoU（全图） ===
+        # 对齐后的渲染图前景掩码
+        aligned_fg_full = np.any(aligned > 0, axis=-1)
+        # 目标图前景掩码
+        target_fg_full = np.max(target_normal, axis=-1) >= 6
+
+        intersection = np.sum(aligned_fg_full & target_fg_full)
+        union = np.sum(aligned_fg_full | target_fg_full)
+        silhouette_iou = intersection / max(union, 1)
+
+        # === 2. 法线方向相似度（AABB区域内） ===
+        t_bbox = self.compute_foreground_bbox(target_normal, is_target=True)
+        min_x, min_y, max_x, max_y = t_bbox
+
+        # 裁剪AABB区域
+        region_aligned = aligned[min_y:max_y+1, min_x:max_x+1].astype(np.float32)
+        region_target = target_normal[min_y:max_y+1, min_x:max_x+1].astype(np.float32)
+
+        # 在AABB区域内，找到两张图都有前景的像素
+        aligned_fg = np.any(region_aligned > 0, axis=-1)
+        target_fg = np.max(region_target, axis=-1) >= 6
+        valid_mask = aligned_fg & target_fg
+
+        valid_count = np.sum(valid_mask)
+        if valid_count == 0:
+            # 没有重叠像素，只靠轮廓IoU
+            return float(0.5 * silhouette_iou)
+
+        # 提取有效像素
+        v_aligned = region_aligned[valid_mask]  # (N, 3)
+        v_target = region_target[valid_mask]    # (N, 3)
+
+        # RGB归一化为单位向量
+        norm_a = np.linalg.norm(v_aligned, axis=1, keepdims=True)
+        norm_t = np.linalg.norm(v_target, axis=1, keepdims=True)
+        norm_a = np.maximum(norm_a, 1e-8)
+        norm_t = np.maximum(norm_t, 1e-8)
+
+        v_aligned_unit = v_aligned / norm_a
+        v_target_unit = v_target / norm_t
+
+        # 计算归一化向量差的L2距离
+        diff = np.linalg.norm(v_aligned_unit - v_target_unit, axis=1)
+
+        # 归一化到 [0, 1]：diff 范围 [0, 2]，所以 similarity = 1 - mean(diff)/2
+        mean_diff = np.mean(diff)
+        normal_similarity = 1.0 - mean_diff / 2.0
+
+        # === 3. 综合评分 ===
+        # 50% 法线方向匹配 + 50% 轮廓形状匹配
+        # 轮廓IoU直接惩罚形状不匹配（多出或缺少的区域）
+        # 法线相似度衡量重叠区域的颜色/方向匹配质量
+        final_similarity = 0.5 * normal_similarity + 0.5 * silhouette_iou
+
+        return float(final_similarity)
+
     def _normalize_params(self, params: np.ndarray) -> Tuple[float, float, float]:
         """
         规范化参数：处理方位角周期性，限制仰角和距离范围。
-        
+
         参数:
-            params: [azimuth, elevation, distance] 原始参数
-        
+            params: [azimuth, elevation, log_rel_dist] 原始参数
+                    其中 log_rel_dist 是对数相对距离
+
         返回:
-            (azimuth, elevation, distance) 规范化后的参数
+            (azimuth, elevation, distance) 规范化后的参数（distance为绝对距离）
         """
-        azimuth, elevation, distance = params
-        
+        azimuth, elevation, log_rel_dist = params
+
         # 方位角：周期性处理（0到2π）
         azimuth = azimuth % (2 * np.pi)
-        
+
         # 仰角：限制范围，避免万向锁
         elevation = np.clip(elevation, ELEVATION_RANGE[0], ELEVATION_RANGE[1])
-        
-        # 距离：必须为正值
-        min_dist = DISTANCE_MIN * self.mesh_scale
-        max_dist = DISTANCE_MAX * self.mesh_scale
-        distance = np.clip(distance, min_dist, max_dist)
-        
+
+        # 距离：对数空间 -> 实际距离
+        # log_rel_dist 限制在 [LOG_DIST_MIN, LOG_DIST_MAX]
+        log_rel_dist = np.clip(log_rel_dist, LOG_DIST_MIN, LOG_DIST_MAX)
+        distance = self.mesh_scale * np.exp(log_rel_dist)
+
         return azimuth, elevation, distance
     
-    def _objective_function(self, params: np.ndarray, target_mask: np.ndarray) -> float:
+    def _objective_function(self, params: np.ndarray, target_normal: np.ndarray) -> float:
         """
         CMA-ES的目标函数：返回负相似度（因为CMA-ES最小化目标函数）。
-        
+
         参数:
             params: [azimuth, elevation, distance]
-            target_mask: 目标掩码或深度图
-        
+            target_normal: 目标法线图 (H, W, 3) RGB
+
         返回:
             负相似度值
         """
         # 规范化参数
         azimuth, elevation, distance = self._normalize_params(params)
-        
-        if USE_DEPTH_GRADIENT:
-            # 使用深度梯度方法
-            # 渲染深度图
-            rendered_depth = self.render_silhouette(azimuth, elevation, distance, return_depth=True)
-            
-            # 调整尺寸以匹配目标深度图
-            if rendered_depth.shape != target_mask.shape:
-                rendered_depth = cv2.resize(
-                    rendered_depth, 
-                    (target_mask.shape[1], target_mask.shape[0]),
-                    interpolation=cv2.INTER_LINEAR
-                )
-            
-            # 计算梯度相似度（自动对齐）
-            gradient_similarity = self.compute_gradient_similarity(rendered_depth, target_mask, align=True)
-            
-            # 获取对齐后的渲染深度图用于显示
-            rendered_mask = (rendered_depth > 6).astype(np.uint8) * 255
-            target_mask_binary = (target_mask > 6).astype(np.uint8) * 255
-            rendered_mask_aligned = self.align_masks(rendered_mask, target_mask_binary)
-            rendered_depth_aligned = self.align_depth_with_mask(rendered_depth, rendered_mask, rendered_mask_aligned, target_mask.shape)
-            
-            # 计算mask IoU（使用对齐后的mask）
-            mask_iou = self.compute_iou(rendered_mask, target_mask_binary, align=True)
-            
-            # 混合相似度：梯度相似度50% + mask IoU 50%
-            similarity = 0.5 * gradient_similarity + 0.5 * mask_iou
-        else:
-            # 使用mask方法
-            # 渲染mask
-            rendered = self.render_silhouette(azimuth, elevation, distance, return_depth=False)
-            
-            # 调整尺寸以匹配目标mask
-            if rendered.shape != target_mask.shape:
-                rendered = cv2.resize(
-                    rendered, 
-                    (target_mask.shape[1], target_mask.shape[0]),
-                    interpolation=cv2.INTER_NEAREST
-                )
-            
-            # 计算IoU（自动对齐）
-            similarity = self.compute_iou(rendered, target_mask, align=True)
-            
-            # 获取对齐后的渲染mask用于显示
-            rendered_mask_aligned = self.align_masks(rendered, target_mask)
-            rendered_depth_aligned = None
-        
-        DEBUG_RENDER_PROB = 0.02  # 2% 的概率输出
+
+        # 渲染法线图（使用动态FOV使主体占满画面，距离只影响透视程度）
+        rendered_normal = self.render_silhouette(azimuth, elevation, distance,
+                                                 use_adaptive_fov=True, return_normal=True)
+
+        # 调整尺寸以匹配目标法线图
+        if rendered_normal.shape[:2] != target_normal.shape[:2]:
+            rendered_normal = cv2.resize(
+                rendered_normal,
+                (target_normal.shape[1], target_normal.shape[0]),
+                interpolation=cv2.INTER_LINEAR
+            )
+
+        # 计算法线相似度（自动对齐）
+        similarity = self.compute_normal_similarity(rendered_normal, target_normal, align=True)
+
+        # 调试输出
+        DEBUG_RENDER_PROB = 0.02
         if np.random.random() < DEBUG_RENDER_PROB and DEBUG_OUTPUT:
             debug_dir = os.path.join(OUTPUT_DIR, 'debug_renders')
             os.makedirs(debug_dir, exist_ok=True)
-            
-            if USE_DEPTH_GRADIENT:
-                # 深度梯度方法的可视化
-                # 创建对比图
-                fig, axes = plt.subplots(1, 4, figsize=(16, 4))
-                
-                # 目标深度图
-                axes[0].imshow(target_mask, cmap='gray')
-                axes[0].set_title('Target Depth')
-                axes[0].axis('off')
-                
-                # 对齐后的渲染深度图
-                axes[1].imshow(rendered_depth_aligned, cmap='gray')
-                rel_dist = elevation / self.mesh_scale
-                axes[1].set_title(f'Rendered Depth (Aligned)\nAz:{np.degrees(azimuth):.1f}° El:{elevation:.1f}° D:{distance/self.mesh_scale:.2f}x')
-                axes[1].axis('off')
-                
-                # 梯度对比
-                target_grad_x, target_grad_y = self.compute_gradient(target_mask, ksize=3)
-                rendered_grad_x, rendered_grad_y = self.compute_gradient(rendered_depth_aligned, ksize=5)
-                target_grad_mag = np.sqrt(target_grad_x**2 + target_grad_y**2)
-                rendered_grad_mag = np.sqrt(rendered_grad_x**2 + rendered_grad_y**2)
-                
-                # 归一化梯度幅值
-                target_grad_mag_norm = target_grad_mag / (np.max(target_grad_mag) + 1e-8)
-                rendered_grad_mag_norm = rendered_grad_mag / (np.max(rendered_grad_mag) + 1e-8)
-                
-                # 叠加梯度图（红色=目标梯度，绿色=渲染梯度）
-                grad_overlay = np.zeros((*target_mask.shape, 3), dtype=np.uint8)
-                grad_overlay[:, :, 0] = (target_grad_mag_norm * 255).astype(np.uint8)  # 红色 = 目标梯度
-                grad_overlay[:, :, 1] = (rendered_grad_mag_norm * 255).astype(np.uint8)  # 绿色 = 渲染梯度
-                axes[2].imshow(grad_overlay)
-                axes[2].set_title(f'Gradient Overlay\nGrad: {gradient_similarity:.3f} IoU: {mask_iou:.3f}')
-                axes[2].axis('off')
-                
-                # 梯度差异图
-                grad_diff = np.abs(target_grad_mag_norm - rendered_grad_mag_norm)
-                axes[3].imshow(grad_diff, cmap='hot')
-                axes[3].set_title(f'Gradient Difference\nCombined: {similarity:.4f}')
-                axes[3].axis('off')
-            else:
-                # Mask方法的可视化
-                # 创建对比图
-                fig, axes = plt.subplots(1, 3, figsize=(12, 4))
-                
-                # 目标掩码
-                axes[0].imshow(target_mask, cmap='gray')
-                axes[0].set_title('Target')
-                axes[0].axis('off')
-                
-                # 对齐后的渲染
-                axes[1].imshow(rendered_mask_aligned, cmap='gray')
-                rel_dist = elevation / self.mesh_scale
-                axes[1].set_title(f'Rendered (Aligned)\nAz:{np.degrees(azimuth):.1f}° El:{elevation:.1f}° D:{distance/self.mesh_scale:.2f}x')
-                axes[1].axis('off')
-                
-                # 叠加对比（使用对齐后的图像）
-                overlay = np.zeros((*target_mask.shape, 3), dtype=np.uint8)
-                overlay[:, :, 0] = target_mask  # 红色 = 目标
-                overlay[:, :, 1] = rendered_mask_aligned     # 绿色 = 渲染（对齐后）
-                axes[2].imshow(overlay)
-                axes[2].set_title(f'Overlay (IoU: {similarity:.4f})')
-                axes[2].axis('off')
-            
+
+            aligned, _ = self.align_rendered_to_target(rendered_normal, target_normal)
+
+            fig, axes = plt.subplots(1, 4, figsize=(16, 4))
+
+            axes[0].imshow(target_normal)
+            axes[0].set_title('Target Normal')
+            axes[0].axis('off')
+
+            axes[1].imshow(aligned)
+            axes[1].set_title(f'Rendered (Aligned)\nAz:{np.degrees(azimuth):.1f} El:{elevation:.1f} D:{distance/self.mesh_scale:.2f}x')
+            axes[1].axis('off')
+
+            overlay = (target_normal.astype(np.float32) * 0.5 + aligned.astype(np.float32) * 0.5).astype(np.uint8)
+            axes[2].imshow(overlay)
+            axes[2].set_title(f'Overlay\nSimilarity: {similarity:.4f}')
+            axes[2].axis('off')
+
+            diff = np.linalg.norm(target_normal.astype(np.float32) - aligned.astype(np.float32), axis=2)
+            axes[3].imshow(diff, cmap='cool', vmin=0, vmax=255*np.sqrt(3))
+            axes[3].set_title('L2 Difference')
+            axes[3].axis('off')
+
             plt.suptitle(f'Iteration {self.iteration_count}', fontsize=12)
             plt.tight_layout()
-            
+
             save_path = os.path.join(debug_dir, f'iter_{self.iteration_count:05d}_sim_{similarity:.4f}.png')
             plt.savefig(save_path, dpi=100, bbox_inches='tight')
             plt.close()
-            
-            if self.verbose:
-                print(f"    [Debug] Saved render: {save_path}")
 
         # 记录最佳结果
         if similarity > self.best_iou:
             self.best_iou = similarity
             self.best_params = (azimuth, elevation, distance)
-        
+
         self.iteration_count += 1
-        
+
         # 记录历史
         self.history.append({
             'iteration': self.iteration_count,
@@ -929,13 +1199,12 @@ class PoseOptimizer:
             'elevation': elevation,
             'distance': distance
         })
-        
+
         # 定期打印进度
         if self.verbose and self.iteration_count % 20 == 0:
-            metric_name = 'Similarity' if USE_DEPTH_GRADIENT else 'IoU'
-            print(f"  迭代 {self.iteration_count}: {metric_name} = {similarity:.4f}, "
-                  f"最佳 {metric_name} = {self.best_iou:.4f}")
-        
+            print(f"  迭代 {self.iteration_count}: 相似度 = {similarity:.4f}, "
+                  f"最佳 = {self.best_iou:.4f}")
+
         # 返回负相似度（因为CMA-ES最小化目标函数）
         return -similarity
     
@@ -945,18 +1214,22 @@ class PoseOptimizer:
         initial_params: Optional[np.ndarray] = None,
         sigma: float = CMAES_SIGMA,
         popsize: int = CMAES_POPSIZE,
-        maxiter: int = CMAES_MAXITER
+        maxiter: int = CMAES_MAXITER,
+        use_parallel: bool = USE_PARALLEL,
+        num_workers: Optional[int] = NUM_WORKERS
     ) -> Dict[str, Any]:
         """
         执行CMA-ES优化，寻找最佳相机参数。
-        
+
         参数:
             target_mask: 目标二值掩码图像
             initial_params: 初始参数 [azimuth, elevation, distance]，None则随机初始化
             sigma: CMA-ES初始步长
             popsize: 种群大小
             maxiter: 最大迭代次数
-        
+            use_parallel: 是否使用并行计算
+            num_workers: 并行进程数（None=自动检测）
+
         返回:
             包含优化结果的字典
         """
@@ -976,24 +1249,18 @@ class PoseOptimizer:
         self.best_iou = 0.0
         self.best_params = None
         self.history = []
-        
-        # 预处理目标掩码/深度图
-        if len(target_mask.shape) == 3:
-            target_mask = cv2.cvtColor(target_mask, cv2.COLOR_BGR2GRAY)
-        
-        if USE_DEPTH_GRADIENT:
-            # 深度梯度方法：不进行阈值处理，保留深度值
-            pass
-        else:
-            # Mask方法：进行阈值处理
-            _, target_mask = cv2.threshold(target_mask, 1, 255, cv2.THRESH_BINARY)
-        
-        # 调整目标掩码大小
-        interpolation = cv2.INTER_LINEAR if USE_DEPTH_GRADIENT else cv2.INTER_NEAREST
+
+        # 预处理目标法线图
+        if len(target_mask.shape) == 2:
+            target_mask = cv2.cvtColor(target_mask, cv2.COLOR_GRAY2RGB)
+        elif len(target_mask.shape) == 3 and target_mask.shape[2] == 4:
+            target_mask = cv2.cvtColor(target_mask, cv2.COLOR_BGRA2RGB)
+
+        # 调整大小到渲染分辨率
         target_mask = cv2.resize(
             target_mask,
             self.render_resolution,
-            interpolation=interpolation
+            interpolation=cv2.INTER_LINEAR
         )
         
         if self.verbose:
@@ -1001,49 +1268,130 @@ class PoseOptimizer:
             print(f"  种群大小: {popsize}")
             print(f"  最大迭代: {maxiter}")
             print(f"  初始步长: {sigma}")
+            if use_parallel:
+                if num_workers is None:
+                    # 自动模式：CPU核数的一半，最小1，最大不超过(CPU总数-4)
+                    cpu_count = multiprocessing.cpu_count()
+                    half_cpus = cpu_count // 2
+                    max_workers = cpu_count - 4
+                    actual_workers = max(1, min(half_cpus, max_workers))
+                else:
+                    actual_workers = num_workers
+                print(f"  并行模式: 启用 ({actual_workers} 个进程)")
+            else:
+                print(f"  并行模式: 禁用 (串行评估)")
         
         # 初始参数
         if initial_params is None:
-            # 随机初始化
+            # 从正面略微仰视的角度开始
             initial_params = np.array([
-                np.random.uniform(0, 2 * np.pi),           # azimuth
-                np.random.uniform(-30, 30),                 # elevation
-                self.mesh_scale * 2.5                       # distance
+                0.0,                                        # azimuth: 正面（0°）
+                20.0,                                       # elevation: 略微仰视（20°）
+                np.log(2.5)                                 # log_rel_dist: log(2.5) ≈ 0.916
             ])
         
         if self.verbose:
             print(f"  初始参数: 方位角={np.degrees(initial_params[0]):.1f}°, "
                   f"仰角={initial_params[1]:.1f}°, "
-                  f"距离={initial_params[2]:.2f}")
+                  f"相对距离={np.exp(initial_params[2]):.2f}x (log={initial_params[2]:.3f})")
         
         # CMA-ES优化选项
+        # 各维度使用不同的初始标准差：
+        #   方位角: ~1.5 rad (~86°) 覆盖大范围角度, 仰角: ~25° 覆盖[-30,60], log距离: ~0.4
         opts = {
             'popsize': popsize,
             'maxiter': maxiter,
             'tolx': CMAES_TOLX,
             'tolfun': CMAES_TOLFUN,
             'verb_disp': 0,  # 禁用CMA-ES的内置输出
+            'CMA_stds': [1.5, 25.0, 0.4],  # 各维度初始标准差比例 - 更大以增加探索范围
             'bounds': [
-                [0, ELEVATION_RANGE[0], DISTANCE_MIN * self.mesh_scale],      # 下界
-                [2 * np.pi, ELEVATION_RANGE[1], DISTANCE_MAX * self.mesh_scale]  # 上界
+                [0, ELEVATION_RANGE[0], LOG_DIST_MIN],      # 下界
+                [2 * np.pi, ELEVATION_RANGE[1], LOG_DIST_MAX]  # 上界
             ]
         }
         
         # 执行CMA-ES优化
         es = cma.CMAEvolutionStrategy(initial_params, sigma, opts)
-        
-        while not es.stop():
-            # 获取候选解
-            solutions = es.ask()
-            
-            # 评估每个候选解
-            fitnesses = [
-                self._objective_function(sol, target_mask) 
-                for sol in solutions
-            ]
-            
-            # 更新CMA-ES
-            es.tell(solutions, fitnesses)
+
+        # 如果使用并行计算，创建进程池
+        if use_parallel:
+            if num_workers is None:
+                # 自动模式：CPU核数的一半，最小1，最大不超过(CPU总数-4)
+                cpu_count = multiprocessing.cpu_count()
+                half_cpus = cpu_count // 2
+                max_workers = cpu_count - 4
+                actual_workers = max(1, min(half_cpus, max_workers))
+            else:
+                actual_workers = num_workers
+
+            # 创建带initializer的进程池，每个worker进程初始化一次渲染器
+            executor = ProcessPoolExecutor(
+                max_workers=actual_workers,
+                initializer=_init_worker,
+                initargs=(MESH_PATH, self.render_resolution)
+            )
+
+            # 创建部分应用的评估函数（不需要传递mesh_path和render_resolution）
+            eval_func = partial(
+                _evaluate_single_solution,
+                target_normal=target_mask,
+                mesh_center=self.mesh_center,
+                mesh_scale=self.mesh_scale
+            )
+        else:
+            executor = None
+
+        try:
+            while not es.stop():
+                # 获取候选解
+                solutions = es.ask()
+
+                # 评估每个候选解
+                if use_parallel and executor is not None:
+                    # 并行评估
+                    fitnesses = list(executor.map(eval_func, solutions))
+
+                    # 更新历史记录（串行模式下在_objective_function中更新）
+                    for sol, fitness in zip(solutions, fitnesses):
+                        similarity = -fitness
+                        azimuth, elevation, log_rel_dist = sol
+                        azimuth = azimuth % (2 * np.pi)
+                        elevation = np.clip(elevation, ELEVATION_RANGE[0], ELEVATION_RANGE[1])
+                        log_rel_dist = np.clip(log_rel_dist, LOG_DIST_MIN, LOG_DIST_MAX)
+                        distance = self.mesh_scale * np.exp(log_rel_dist)
+
+                        self.iteration_count += 1
+                        self.history.append({
+                            'iteration': self.iteration_count,
+                            'iou': similarity,
+                            'azimuth': azimuth,
+                            'elevation': elevation,
+                            'distance': distance
+                        })
+
+                        if similarity > self.best_iou:
+                            self.best_iou = similarity
+                            self.best_params = (azimuth, elevation, distance)
+
+                    # 定期打印进度
+                    if self.verbose and self.iteration_count % (popsize * 5) == 0:
+                        print(f"  迭代 {self.iteration_count // popsize}: "
+                              f"当前最佳相似度 = {self.best_iou:.4f}")
+                else:
+                    # 串行评估（使用原有的_objective_function）
+                    fitnesses = [
+                        self._objective_function(sol, target_mask)
+                        for sol in solutions
+                    ]
+
+                # 更新CMA-ES
+                es.tell(solutions, fitnesses)
+
+        finally:
+            # 关闭进程池
+            if executor is not None:
+                executor.shutdown(wait=True)
         
         # 获取最终结果
         final_params = self._normalize_params(es.result.xbest)
@@ -1082,156 +1430,89 @@ class PoseOptimizer:
     
     def visualize_result(
         self,
-        target_mask: np.ndarray,
+        target_normal: np.ndarray,
         result: Dict[str, Any],
         save_path: Optional[str] = None
     ):
         """
         可视化优化结果。
-        
+
         参数:
-            target_mask: 目标掩码
+            target_normal: 目标法线图 (H, W, 3) RGB
             result: optimize()返回的结果字典
             save_path: 保存路径，None则显示
         """
-        if USE_DEPTH_GRADIENT:
-            # 深度梯度方法的可视化
-            # 渲染最终结果（注意：result['azimuth']是度数，需要转换为弧度）
-            rendered_depth = self.render_silhouette(
-                np.radians(result['azimuth']),  # 转换为弧度
-                result['elevation'],
-                result['distance'],
-                return_depth=True
-            )
-            
-            # 调整尺寸
-            if len(target_mask.shape) == 3:
-                target_mask = cv2.cvtColor(target_mask, cv2.COLOR_BGR2GRAY)
-            target_mask = cv2.resize(target_mask, self.render_resolution, interpolation=cv2.INTER_LINEAR)
-            
-            # 对齐渲染深度图到target深度图
-            rendered_mask = (rendered_depth > 6).astype(np.uint8) * 255
-            target_mask_binary = (target_mask > 6).astype(np.uint8) * 255
-            rendered_mask_aligned = self.align_masks(rendered_mask, target_mask_binary)
-            rendered_depth_aligned = self.align_depth_with_mask(rendered_depth, rendered_mask, rendered_mask_aligned, target_mask.shape)
-            
-            # 计算分项相似度用于显示
-            gradient_sim = self.compute_gradient_similarity(rendered_depth, target_mask, align=True)
-            mask_iou = self.compute_iou(rendered_mask, target_mask_binary, align=True)
-            
-            # 创建对比图
-            fig, axes = plt.subplots(1, 4, figsize=(16, 4))
-            
-            # 目标深度图
-            axes[0].imshow(target_mask, cmap='gray')
-            axes[0].set_title('Target Depth')
-            axes[0].axis('off')
-            
-            # 对齐后的渲染深度图
-            axes[1].imshow(rendered_depth_aligned, cmap='gray')
-            axes[1].set_title(f'Rendered Depth (Aligned)\nAz: {result["azimuth_deg"]:.1f}° El: {result["elevation"]:.1f}°\n'
-                             f'D: {result["distance"]/self.mesh_scale:.2f}x')
-            axes[1].axis('off')
-            
-            # 梯度对比
-            target_grad_x, target_grad_y = self.compute_gradient(target_mask, ksize=3)
-            rendered_grad_x, rendered_grad_y = self.compute_gradient(rendered_depth_aligned, ksize=5)
-            target_grad_mag = np.sqrt(target_grad_x**2 + target_grad_y**2)
-            rendered_grad_mag = np.sqrt(rendered_grad_x**2 + rendered_grad_y**2)
-            
-            # 归一化梯度幅值
-            target_grad_mag_norm = target_grad_mag / (np.max(target_grad_mag) + 1e-8)
-            rendered_grad_mag_norm = rendered_grad_mag / (np.max(rendered_grad_mag) + 1e-8)
-            
-            # 叠加梯度图（红色=目标梯度，绿色=渲染梯度）
-            grad_overlay = np.zeros((*target_mask.shape, 3), dtype=np.uint8)
-            grad_overlay[:, :, 0] = (target_grad_mag_norm * 255).astype(np.uint8)  # 红色 = 目标梯度
-            grad_overlay[:, :, 1] = (rendered_grad_mag_norm * 255).astype(np.uint8)  # 绿色 = 渲染梯度
-            axes[2].imshow(grad_overlay)
-            axes[2].set_title(f'Gradient Overlay\nGrad: {gradient_sim:.3f} IoU: {mask_iou:.3f}\nCombined: {result["iou"]:.4f}')
-            axes[2].axis('off')
-            
-            # 优化历史
-            if result['history']:
-                ious = [h['iou'] for h in result['history']]
-                axes[3].plot(ious, 'b-', alpha=0.3)
-                # 添加滑动平均线
-                window = min(20, len(ious))
-                if window > 1:
-                    smoothed = np.convolve(ious, np.ones(window)/window, mode='valid')
-                    axes[3].plot(range(window-1, len(ious)), smoothed, 'r-', linewidth=2)
-                axes[3].set_xlabel('Evaluations')
-                axes[3].set_ylabel('Similarity')
-                axes[3].set_title('Optimization Progress')
-                axes[3].grid(True, alpha=0.3)
-        else:
-            # Mask方法的可视化
-            # 渲染最终结果（注意：result['azimuth']是度数，需要转换为弧度）
-            rendered = self.render_silhouette(
-                np.radians(result['azimuth']),  # 转换为弧度
-                result['elevation'],
-                result['distance'],
-                return_depth=False
-            )
-            
-            # 调整尺寸
-            if len(target_mask.shape) == 3:
-                target_mask = cv2.cvtColor(target_mask, cv2.COLOR_BGR2GRAY)
-            target_mask = cv2.resize(target_mask, self.render_resolution, interpolation=cv2.INTER_NEAREST)
-            
-            # 阈值处理（因为target是深度灰度图）
-            _, target_mask_binary = cv2.threshold(target_mask, 1, 255, cv2.THRESH_BINARY)
-            
-            # 对齐渲染mask到target mask
-            rendered_aligned = self.align_masks(rendered, target_mask_binary)
-            
-            # 创建对比图
-            fig, axes = plt.subplots(1, 4, figsize=(16, 4))
-            
-            # 目标掩码
-            axes[0].imshow(target_mask, cmap='gray')
-            axes[0].set_title('Target')
-            axes[0].axis('off')
-            
-            # 对齐后的渲染结果
-            axes[1].imshow(rendered_aligned, cmap='gray')
-            axes[1].set_title(f'Rendered (Aligned)\nAz: {result["azimuth_deg"]:.1f}° El: {result["elevation"]:.1f}°\n'
-                             f'D: {result["distance"]/self.mesh_scale:.2f}x')
-            axes[1].axis('off')
-            
-            # 叠加对比（红=目标（阈值处理后），绿=渲染，黄=重叠）
-            overlay = np.zeros((*target_mask.shape, 3), dtype=np.uint8)
-            overlay[:, :, 0] = target_mask_binary  # 红色通道 = 目标（阈值处理后）
-            overlay[:, :, 1] = rendered_aligned     # 绿色通道 = 渲染（对齐后）
-            axes[2].imshow(overlay)
-            axes[2].set_title(f'Overlay\nRed=Target (Thresholded), Green=Rendered\nIoU: {result["iou"]:.4f}')
-            axes[2].axis('off')
-            
-            # 优化历史
-            if result['history']:
-                ious = [h['iou'] for h in result['history']]
-                axes[3].plot(ious, 'b-', alpha=0.3)
-                # 添加滑动平均线
-                window = min(20, len(ious))
-                if window > 1:
-                    smoothed = np.convolve(ious, np.ones(window)/window, mode='valid')
-                    axes[3].plot(range(window-1, len(ious)), smoothed, 'r-', linewidth=2)
-                axes[3].set_xlabel('Evaluations')
-                axes[3].set_ylabel('IoU')
-                axes[3].set_title('Optimization Progress')
-                axes[3].grid(True, alpha=0.3)
-        
+        # 渲染最终结果
+        rendered_normal = self.render_silhouette(
+            np.radians(result['azimuth']),
+            result['elevation'],
+            result['distance'],
+            use_adaptive_fov=True,
+            return_normal=True
+        )
+
+        # 确保target是RGB格式
+        if len(target_normal.shape) == 2:
+            target_normal = cv2.cvtColor(target_normal, cv2.COLOR_GRAY2RGB)
+        elif len(target_normal.shape) == 3 and target_normal.shape[2] == 4:
+            target_normal = cv2.cvtColor(target_normal, cv2.COLOR_BGRA2RGB)
+
+        # 调整尺寸
+        target_normal = cv2.resize(target_normal, self.render_resolution, interpolation=cv2.INTER_LINEAR)
+
+        # 对齐渲染法线图
+        if rendered_normal.shape[:2] != target_normal.shape[:2]:
+            rendered_normal = cv2.resize(rendered_normal, (target_normal.shape[1], target_normal.shape[0]),
+                                        interpolation=cv2.INTER_LINEAR)
+        aligned, _ = self.align_rendered_to_target(rendered_normal, target_normal)
+
+        # 计算相似度
+        similarity = self.compute_normal_similarity(rendered_normal, target_normal, align=True)
+
+        # 创建对比图
+        fig, axes = plt.subplots(1, 4, figsize=(16, 4))
+
+        # 目标法线图
+        axes[0].imshow(target_normal)
+        axes[0].set_title('Target Normal Map')
+        axes[0].axis('off')
+
+        # 对齐后的渲染法线图
+        axes[1].imshow(aligned)
+        axes[1].set_title(f'Rendered Normal (Aligned)\nAz: {result["azimuth_deg"]:.1f} El: {result["elevation"]:.1f}\n'
+                         f'D: {result["distance"]/self.mesh_scale:.2f}x')
+        axes[1].axis('off')
+
+        # 差异热图
+        diff_map = np.linalg.norm(target_normal.astype(np.float32) - aligned.astype(np.float32), axis=2)
+        axes[2].imshow(diff_map, cmap='cool', vmin=0, vmax=255*np.sqrt(3))
+        axes[2].set_title(f'Pixel Difference\nSimilarity: {similarity:.4f}')
+        axes[2].axis('off')
+
+        # 优化历史
+        if result['history']:
+            similarities = [h['iou'] for h in result['history']]
+            axes[3].plot(similarities, 'b-', alpha=0.3)
+            window = min(20, len(similarities))
+            if window > 1:
+                smoothed = np.convolve(similarities, np.ones(window)/window, mode='valid')
+                axes[3].plot(range(window-1, len(similarities)), smoothed, 'r-', linewidth=2)
+            axes[3].set_xlabel('Evaluations')
+            axes[3].set_ylabel('Normal Similarity')
+            axes[3].set_title('Optimization Progress')
+            axes[3].grid(True, alpha=0.3)
+
         plt.tight_layout()
-        
+
         if save_path:
-            os.makedirs(os.path.dirname(save_path) if os.path.dirname(save_path) else '.', 
+            os.makedirs(os.path.dirname(save_path) if os.path.dirname(save_path) else '.',
                        exist_ok=True)
             plt.savefig(save_path, dpi=150, bbox_inches='tight')
             if self.verbose:
                 print(f"结果已保存至: {save_path}")
         else:
             plt.show()
-        
+
         plt.close()
     
     def show_interactive_result(self, result: Dict[str, Any]):
@@ -1339,122 +1620,45 @@ class PoseOptimizer:
         return distance / self.mesh_scale
 
 
-def create_test_mask(optimizer: PoseOptimizer, azimuth_deg: float = 45.0,
-                     elevation_deg: float = 30.0) -> np.ndarray:
-    """
-    创建测试用的目标掩码（用于自检模式）。
-    
-    参数:
-        optimizer: PoseOptimizer实例
-        azimuth_deg: 真实方位角（度）
-        elevation_deg: 真实仰角（度）
-    
-    返回:
-        生成的目标掩码
-    """
-    distance = optimizer.mesh_scale * 2.5
-    azimuth_rad = np.radians(azimuth_deg)
-    
-    mask = optimizer.render_silhouette(azimuth_rad, elevation_deg, distance)
-    
-    return mask
-
-
 # ============================================================================
 # 主函数
 # ============================================================================
 
 def main():
     """
-    主函数：执行完整的位姿估计流程。
+    主函数：执行完整的法线匹配位姿估计流程。
     """
     print("=" * 60)
-    print("基于分析合成的6D位姿估计")
+    print("基于法线匹配的6D位姿估计")
     print("=" * 60)
-    
+
     # 创建输出目录
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-    
-    # 用于记录真实参数（自检模式）
-    run_self_check = False
-    gt_params = None
-    
-    # --- 自检模式：如果目标掩码不存在，则生成一个 ---
-    if not os.path.exists(TARGET_MASK_PATH):
-        print(f"\n[自检模式] 未找到目标掩码: {TARGET_MASK_PATH}")
-        print("将使用已知参数生成合成目标掩码进行测试...\n")
-        
-        # 检查网格文件是否存在
-        if not os.path.exists(MESH_PATH):
-            print(f"[错误] 网格文件不存在: {MESH_PATH}")
-            print("请提供有效的网格文件路径。")
-            
-            # 创建一个简单的测试网格
-            print("\n[自检模式] 创建测试立方体网格...")
-            test_mesh = trimesh.creation.box(extents=[1.0, 1.0, 1.0])
-            os.makedirs(os.path.dirname(MESH_PATH) if os.path.dirname(MESH_PATH) else '.', exist_ok=True)
-            test_mesh.export(MESH_PATH)
-            print(f"已创建测试网格: {MESH_PATH}")
-        
-        # 临时创建优化器来生成目标掩码
-        temp_optimizer = PoseOptimizer(
-            mesh_path=MESH_PATH,
-            render_resolution=(RENDER_WIDTH, RENDER_HEIGHT),
-            fov=CAMERA_FOV,
-            verbose=False
-        )
-        
-        # 使用已知参数生成目标掩码
-        gt_params = {
-            'azimuth': np.pi / 4,                      # 45度
-            'elevation': 30.0,                          # 30度
-            'distance': 2.5 * temp_optimizer.mesh_scale # 2.5倍网格尺寸
-        }
-        
-        print(f"真实参数: 方位角={np.degrees(gt_params['azimuth']):.1f}°, "
-              f"仰角={gt_params['elevation']:.1f}°, "
-              f"距离={gt_params['distance']:.4f}")
-        
-        # 使用 render_silhouette 生成目标掩码/深度图
-        target_mask = temp_optimizer.render_silhouette(
-            gt_params['azimuth'],
-            gt_params['elevation'],
-            gt_params['distance'],
-            return_depth=USE_DEPTH_GRADIENT
-        )
-        
-        # 保存目标掩码
-        os.makedirs(os.path.dirname(TARGET_MASK_PATH) if os.path.dirname(TARGET_MASK_PATH) else '.', exist_ok=True)
-        cv2.imwrite(TARGET_MASK_PATH, target_mask)
-        print(f"已生成目标掩码: {TARGET_MASK_PATH}\n")
-        
-        temp_optimizer.cleanup()
-        del temp_optimizer
-        
-        run_self_check = True
-    
-    # --- 加载目标掩码 ---
-    print(f"加载目标掩码: {TARGET_MASK_PATH}")
-    target_mask = cv2.imread(TARGET_MASK_PATH, cv2.IMREAD_GRAYSCALE)
-    
-    if target_mask is None:
-        print(f"[错误] 无法加载目标掩码: {TARGET_MASK_PATH}")
+
+    # --- 加载目标法线图 ---
+    target_normal_path = "./target_normal.png"
+    print(f"\n加载目标法线图: {target_normal_path}")
+    target_normal = cv2.imread(target_normal_path, cv2.IMREAD_COLOR)
+
+    if target_normal is None:
+        print(f"[错误] 无法加载目标法线图: {target_normal_path}")
         return None, None
-    
+
+    # OpenCV读取的是BGR格式，转换为RGB
+    target_normal = cv2.cvtColor(target_normal, cv2.COLOR_BGR2RGB)
+
     # 检查并处理非正方形图像
-    original_shape = target_mask.shape
+    original_shape = target_normal.shape
     if original_shape[0] != original_shape[1]:
         print(f"检测到非正方形图像: {original_shape[1]}x{original_shape[0]}")
-        target_mask = pad_to_square(target_mask, pad_value=0)
-        print(f"已填充为正方形: {target_mask.shape[1]}x{target_mask.shape[0]}")
-    
-    if USE_DEPTH_GRADIENT:
-        print(f"目标深度图尺寸: {target_mask.shape}")
-        print(f"目标深度图有效像素: {np.sum(target_mask > 6)}")
-    else:
-        print(f"目标掩码尺寸: {target_mask.shape}")
-        print(f"目标掩码非零像素: {np.sum(target_mask > 6)}")
-    
+        target_normal = pad_to_square(target_normal, pad_value=0)
+        print(f"已填充为正方形: {target_normal.shape[1]}x{target_normal.shape[0]}")
+
+    print(f"目标法线图尺寸: {target_normal.shape}")
+    # 统计非黑色前景像素
+    fg_pixels = np.sum(np.max(target_normal, axis=-1) >= 6)
+    print(f"目标法线图前景像素: {fg_pixels}")
+
     # --- 创建优化器 ---
     print(f"\n加载网格: {MESH_PATH}")
     optimizer = PoseOptimizer(
@@ -1463,162 +1667,95 @@ def main():
         fov=CAMERA_FOV,
         verbose=VERBOSE
     )
-    
-    # --- 设置初始参数（可选）---
-    initial_params = None
 
     # --- 执行优化 ---
     print("\n" + "=" * 60)
     print("开始CMA-ES优化...")
     print("=" * 60)
-    
+
     result = optimizer.optimize(
-        target_mask=target_mask,
-        initial_params=initial_params,
+        target_mask=target_normal,
+        initial_params=None,
         sigma=CMAES_SIGMA,
         popsize=CMAES_POPSIZE,
         maxiter=CMAES_MAXITER
     )
-    
+
     # --- 输出结果 ---
     print("\n" + "=" * 60)
     print("优化结果 (Z-Up 坐标系)")
     print("=" * 60)
-    print(f"最优方位角: {result['azimuth']:.2f}°")
-    print(f"最优仰角: {result['elevation']:.2f}°")
+    print(f"最优方位角: {result['azimuth']:.2f}")
+    print(f"最优仰角: {result['elevation']:.2f}")
     print(f"最优距离: {result['distance']:.4f} 单位")
     print(f"相对距离: {result['distance'] / optimizer.mesh_scale:.2f}x (相对于网格对角线)")
-    if USE_DEPTH_GRADIENT:
-        print(f"最终梯度相似度: {result['iou']:.4f}")
-    else:
-        print(f"最终IoU: {result['iou']:.4f}")
+    print(f"最终相似度: {result['iou']:.4f}")
     print(f"总迭代次数: {result['iterations']}")
-    
-    # --- 自检模式：比较结果 ---
-    if run_self_check and gt_params is not None:
-        print("\n" + "-" * 40)
-        print("自检模式 - 参数对比")
-        print("-" * 40)
-        
-        azimuth_error = np.abs(np.radians(result['azimuth']) - gt_params['azimuth'])
-        # 处理方位角的周期性
-        azimuth_error = min(azimuth_error, 2 * np.pi - azimuth_error)
-        
-        elevation_error = np.abs(result['elevation'] - gt_params['elevation'])
-        distance_error = np.abs(result['distance'] - gt_params['distance'])
-        
-        print(f"方位角误差: {np.degrees(azimuth_error):.2f}°")
-        print(f"仰角误差: {elevation_error:.2f}°")
-        print(f"距离误差: {distance_error:.4f} 单位")
-        
-        if USE_DEPTH_GRADIENT:
-            # 梯度相似度检查
-            if result['iou'] > 0.7:
-                print("\n✓ 自检通过！梯度相似度较高。")
-            else:
-                print("\n✗ 自检警告：梯度相似度较低。")
-        else:
-            # IoU检查
-            if result['iou'] > 0.8:
-                print("\n✓ 自检通过！IoU较高。")
-            else:
-                print("\n✗ 自检警告：IoU较低。")
-    
+
     # --- 生成可视化 ---
     if SAVE_VISUALIZATION:
         print("\n生成可视化结果...")
-        
-        # 使用内置的可视化方法
+
         viz_path = os.path.join(OUTPUT_DIR, 'optimization_result.png')
-        optimizer.visualize_result(target_mask, result, save_path=viz_path)
-        
-        if USE_DEPTH_GRADIENT:
-            # 保存优化后的深度图（注意：result['azimuth']是度数，需要转换为弧度）
-            optimized_depth = optimizer.render_silhouette(
-                np.radians(result['azimuth']),
-                result['elevation'],
-                result['distance'],
-                return_depth=True
-            )
-            # 调整target_mask尺寸到render_resolution
-            target_mask_resized = cv2.resize(target_mask, optimizer.render_resolution, interpolation=cv2.INTER_LINEAR)
-            # 对齐渲染深度图到target深度图
-            optimized_mask = (optimized_depth > 6).astype(np.uint8) * 255
-            target_mask_binary = (target_mask_resized > 6).astype(np.uint8) * 255
-            optimized_mask_aligned = optimizer.align_masks(optimized_mask, target_mask_binary)
-            optimized_depth_aligned = optimizer.align_depth_with_mask(optimized_depth, optimized_mask, optimized_mask_aligned, target_mask_resized.shape)
-            
-            # 保存深度图
-            depth_output_path = os.path.join(OUTPUT_DIR, 'optimized_depth.png')
-            # 归一化深度图到0-255范围
-            depth_normalized = ((optimized_depth_aligned - np.min(optimized_depth_aligned)) / 
-                               (np.max(optimized_depth_aligned) - np.min(optimized_depth_aligned) + 1e-8) * 255).astype(np.uint8)
-            cv2.imwrite(depth_output_path, depth_normalized)
-            print(f"已保存优化深度图: {depth_output_path}")
-            
-            # 保存对齐后的mask
-            mask_output_path = os.path.join(OUTPUT_DIR, 'optimized_mask.png')
-            cv2.imwrite(mask_output_path, optimized_mask_aligned)
-            print(f"已保存优化掩码: {mask_output_path}")
-        else:
-            # 保存优化后的mask（注意：result['azimuth']是度数，需要转换为弧度）
-            optimized_mask = optimizer.render_silhouette(
-                np.radians(result['azimuth']),
-                result['elevation'],
-                result['distance'],
-                return_depth=False
-            )
-            # 调整target_mask尺寸到render_resolution
-            target_mask_resized = cv2.resize(target_mask, optimizer.render_resolution, interpolation=cv2.INTER_NEAREST)
-            # 对齐渲染mask到target mask
-            optimized_mask_aligned = optimizer.align_masks(optimized_mask, target_mask_resized)
-            
-            # 保存对齐后的mask
-            mask_output_path = os.path.join(OUTPUT_DIR, 'optimized_mask.png')
-            cv2.imwrite(mask_output_path, optimized_mask_aligned)
-            print(f"已保存优化掩码: {mask_output_path}")
-        
+        optimizer.visualize_result(target_normal, result, save_path=viz_path)
+
+        # 保存优化后的法线图
+        optimized_normal = optimizer.render_silhouette(
+            np.radians(result['azimuth']),
+            result['elevation'],
+            result['distance'],
+            use_adaptive_fov=True,
+            return_normal=True
+        )
+        # 调整target尺寸到render_resolution
+        target_resized = cv2.resize(target_normal, optimizer.render_resolution, interpolation=cv2.INTER_LINEAR)
+
+        # 对齐渲染法线图到target
+        optimized_aligned, _ = optimizer.align_rendered_to_target(optimized_normal, target_resized)
+
+        # 保存法线图（RGB -> BGR for cv2）
+        normal_output_path = os.path.join(OUTPUT_DIR, 'optimized_normal.png')
+        normal_bgr = cv2.cvtColor(optimized_aligned, cv2.COLOR_RGB2BGR)
+        cv2.imwrite(normal_output_path, normal_bgr)
+        print(f"已保存优化法线图: {normal_output_path}")
+
         # 保存参数到文本文件
         params_output_path = os.path.join(OUTPUT_DIR, 'estimated_parameters.txt')
         with open(params_output_path, 'w', encoding='utf-8') as f:
-            f.write("6D位姿估计结果\n")
+            f.write("6D位姿估计结果（法线匹配）\n")
             f.write("=" * 40 + "\n\n")
             f.write(f"网格文件: {MESH_PATH}\n")
-            f.write(f"目标掩码: {TARGET_MASK_PATH}\n\n")
+            f.write(f"目标法线图: {target_normal_path}\n\n")
             f.write("估计的相机参数 (Z-Up 坐标系):\n")
-            f.write(f"  方位角 (Azimuth): {result['azimuth']:.4f}°\n")
-            f.write(f"  仰角 (Elevation): {result['elevation']:.4f}°\n")
+            f.write(f"  方位角 (Azimuth): {result['azimuth']:.4f}\n")
+            f.write(f"  仰角 (Elevation): {result['elevation']:.4f}\n")
             f.write(f"  距离 (Distance): {result['distance']:.4f} 单位\n")
             f.write(f"  相对距离 (Relative): {result['distance'] / optimizer.mesh_scale:.4f}x 网格对角线\n\n")
             f.write(f"网格信息:\n")
             f.write(f"  包围盒中心: {optimizer.mesh_center}\n")
-            f.write(f"  网格尺寸: {optimizer.mesh_scale:.4f}\n")
-            f.write(f"  坐标系转换: Z-Up (原始) -> Y-Up (渲染)\n\n")
+            f.write(f"  网格尺寸: {optimizer.mesh_scale:.4f}\n\n")
             f.write(f"优化指标:\n")
-            if USE_DEPTH_GRADIENT:
-                f.write(f"  最终梯度相似度: {result['iou']:.6f}\n")
-            else:
-                f.write(f"  最终IoU: {result['iou']:.6f}\n")
+            f.write(f"  最终相似度: {result['iou']:.6f}\n")
             f.write(f"  迭代次数: {result['iterations']}\n\n")
             f.write("相机变换矩阵 (Y-Up 坐标系，用于 pyrender 渲染):\n")
             f.write(np.array2string(result['camera_pose'], precision=6, suppress_small=True))
         print(f"已保存参数文件: {params_output_path}")
-    
+
     # --- 输出相机变换矩阵 ---
     print("\n相机变换矩阵 (Y-Up 坐标系，用于 pyrender):")
     print(result['camera_pose'])
-    
+
     # --- 交互式可视化 ---
     if SHOW_INTERACTIVE:
         optimizer.show_interactive_result(result)
-    
+
     # 清理资源
     optimizer.cleanup()
-    
+
     print("\n" + "=" * 60)
     print("位姿估计完成!")
     print("=" * 60)
-    
+
     return result, result['camera_pose']
 
 
